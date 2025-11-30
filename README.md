@@ -61,7 +61,7 @@ Value（值）： 粘贴您在步骤 1 中复制的令牌。
 1. 检查构建进度 (Action)
 请立即在浏览器中：
 
-登录您的 GitHub 仓库：https://github.com/你的github用户名/telegram-bot-project
+登录您的 GitHub 仓库：https://github.com/你的用户名/telegram-bot-project
 
 点击顶部的 Actions（操作）标签页。
 
