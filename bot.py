@@ -1,25 +1,29 @@
 import os
+import asyncio
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram import Update
 from telegram.constants import ParseMode
-from typing import Final
+from typing import Final, List
 
 # --- 1. 配置常量和环境变量 ---
 TOKEN: Final[str] = os.environ.get("TOKEN", "YOUR_LOCAL_TEST_TOKEN")
 
-# 从环境变量安全读取 ADMIN_ID 和 TARGET_ID
-# 确保在 Railway/本地 设置 ADMIN_ID 和 TARGET_ID
+# 从环境变量安全读取 ADMIN_ID 和 TARGET_IDS
 try:
     ADMIN_CHAT_ID: Final[int] = int(os.environ.get("ADMIN_ID"))
 except (TypeError, ValueError):
-    # 如果未设置或设置错误，使用一个不可能的 ID
-    ADMIN_CHAT_ID: Final[int] = -9999999999
+    ADMIN_CHAT_ID: Final[int] = -9999999999  # 默认值
     
-try:
-    TARGET_CHAT_ID: Final[int] = int(os.environ.get("TARGET_ID"))
-except (TypeError, ValueError):
-    # 如果未设置或设置错误，使用一个不可能的 ID
-    TARGET_CHAT_ID: Final[int] = -9999999999
+# 读取 TARGET_IDS 字符串并解析为整数列表
+TARGET_IDS_STR: Final[str] = os.environ.get("TARGET_IDS", "")
+TARGET_CHAT_IDS: Final[List[int]] = []
+if TARGET_IDS_STR:
+    # 尝试将每个 ID 转换为整数
+    for id_str in TARGET_IDS_STR.split(','):
+        try:
+            TARGET_CHAT_IDS.append(int(id_str.strip()))
+        except ValueError:
+            print(f"⚠️ 警告：环境变量 TARGET_IDS 中的无效 ID: {id_str}")
 
 
 # --- 2. 处理器函数 ---
@@ -53,26 +57,37 @@ async def relay_message(update: Update, context):
         return # 忽略非文本消息
 
     # ----------------------------------------------------
-    # 逻辑 1: 如果消息来自管理员 (ADMIN_CHAT_ID) -> 转发给 TARGET
+    # 逻辑 1: 如果消息来自管理员 (ADMIN_CHAT_ID) -> 转发给所有 TARGETS
     if incoming_chat_id == ADMIN_CHAT_ID:
         
-        if TARGET_CHAT_ID == ADMIN_CHAT_ID or TARGET_CHAT_ID < 0:
-            await update.message.reply_text("❌ 转发失败：目标 ID 无效或未设置。")
+        if not TARGET_CHAT_IDS:
+            await update.message.reply_text("❌ 转发失败：TARGET_IDS 变量未设置或为空。")
             return
             
-        # 转发给目标用户
-        try:
-            await context.bot.send_message(
-                chat_id=TARGET_CHAT_ID,
-                text=f"【管理员转发】 {text}"
-            )
-            await update.message.reply_text("✅ 消息已转发给目标用户。")
-        except Exception as e:
-            # 如果目标用户屏蔽了机器人，可能会触发这个错误
-            await update.message.reply_text(f"❌ 转发失败，请检查 TARGET_ID 或目标用户是否已启动机器人。错误: {e}")
+        success_count = 0
+        failure_count = 0
+        
+        # 循环转发给列表中的每一个 ID
+        for target_id in TARGET_CHAT_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text=f"【管理员转发】 {text}"
+                )
+                success_count += 1
+                # 为了防止 Telegram API 速率限制，加入微小延迟
+                await asyncio.sleep(0.1) 
+            except Exception:
+                failure_count += 1
+                print(f"❌ 转发到 ID {target_id} 失败。")
+
+        await update.message.reply_text(
+            f"✅ 消息已转发完成：成功 {success_count} 个目标，失败 {failure_count} 个目标。"
+        )
 
     # 逻辑 2: 如果消息来自其他用户 -> 转发给 ADMIN
     else:
+        # 如果是目标 ID 之一发送的消息，也认为是普通用户消息
         if ADMIN_CHAT_ID < 0:
             await update.message.reply_text("❌ 抱歉，管理员 ID 未设置或设置错误，消息无法转发。")
             return
@@ -90,7 +105,6 @@ async def relay_message(update: Update, context):
             await update.message.reply_text("您的消息已转发给管理员，请耐心等待回复。")
         except Exception as e:
             await update.message.reply_text(f"❌ 抱歉，管理员 ID 无效或转发失败。错误: {e}")
-    # ----------------------------------------------------
 
 
 # --- 3. 主函数 ---
@@ -100,8 +114,8 @@ def main():
         print("❌ 错误：TOKEN 环境变量未设置。")
         return
     
-    if ADMIN_CHAT_ID < 0 or TARGET_CHAT_ID < 0:
-        print("⚠️ 警告：ADMIN_ID 或 TARGET_ID 未在环境变量中正确设置，转发功能将受限。")
+    if ADMIN_CHAT_ID < 0:
+        print("⚠️ 警告：ADMIN_ID 未在环境变量中正确设置，接收转发功能将受限。")
 
     try:
         application = Application.builder().token(TOKEN).build()
@@ -113,7 +127,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_message))
 
     print("✅ Bot starting polling...")
-    application.run_polling(poll_interval=1.0) # 设置轮询间隔
+    application.run_polling(poll_interval=1.0) 
 
 if __name__ == '__main__':
     main()
