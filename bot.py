@@ -1,14 +1,26 @@
 import os
 import asyncio
-import re # <-- 新增：用于解析回复消息中的用户ID
+import re
+from typing import Final, List, Optional
 
+# 导入 Telegram Bot 库
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from telegram import Update, InputFile
-from telegram.constants import ParseMode
-from typing import Final, List
+from telegram import Update, InputFile, ParseMode
 
-# --- 1. 配置常量和环境变量 ---
+# 导入 SQLAlchemy 数据库库
+from sqlalchemy import create_engine, Column, Integer
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
+
+# --- 1. 配置常量和数据库初始化 ---
+
 TOKEN: Final[str] = os.environ.get("TOKEN", "YOUR_LOCAL_TEST_TOKEN")
+DATABASE_URL: Optional[str] = os.environ.get("DATABASE_URL")
+
+# 全局数据库对象
+SessionLocal = None
+Base = declarative_base()
 
 try:
     ADMIN_CHAT_ID: Final[int] = int(os.environ.get("ADMIN_ID"))
@@ -24,18 +36,57 @@ if TARGET_IDS_STR:
         except ValueError:
             print(f"⚠️ 警告：环境变量 TARGET_IDS 中的无效 ID: {id_str}")
 
-# 正则表达式：用于从管理员回复的消息中提取用户 ID
-# 匹配格式：【新用户消息】来自 ID: `(\d+)`:
 ID_REGEX: Final = r"【新用户消息】来自 ID: `(\d+)`:"
 
 
-# --- 2. 辅助函数：统一处理媒体转发 ---
+# --- 2. 数据库模型 ---
+
+class BannedUser(Base):
+    """被封禁用户模型"""
+    __tablename__ = 'banned_users'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, unique=True, nullable=False)
+
+    def __repr__(self):
+        return f"<BannedUser(user_id={self.user_id})>"
+
+
+def init_db(db_url: str):
+    """初始化数据库引擎和表"""
+    global SessionLocal
+    # Railway 使用 postgres:// 协议，但 SQLAlchemy 需要 postgresql:// 
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+    
+    engine = create_engine(db_url)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    print("✅ Database initialized and tables created.")
+
+
+def is_user_banned(user_id: int) -> bool:
+    """检查用户是否被封禁"""
+    if SessionLocal is None:
+        return False
+        
+    session = SessionLocal()
+    try:
+        # 使用 SQLAlchemy 2.0 风格的 select
+        stmt = select(BannedUser).where(BannedUser.user_id == user_id)
+        result = session.execute(stmt).scalar_one_or_none()
+        return result is not None
+    finally:
+        session.close()
+
+
+# --- 3. 辅助函数：统一处理媒体转发 ---
 
 async def attempt_forward(bot, message, target_id: int, prefix: str, caption_or_text: str, parse_mode: ParseMode = None) -> bool:
     """Helper function to handle all types of message forwarding."""
     
-    # 消息内容（用于 caption 或 text）
     message_content = f"{caption_or_text if caption_or_text else ''}"
+    
+    # ... (媒体转发逻辑与上一版本保持一致) ...
+    # 为了节省篇幅，这里简化，实际代码中应包含完整的媒体转发逻辑
     
     # --- 媒体转发逻辑 ---
     if message.photo:
@@ -47,26 +98,89 @@ async def attempt_forward(bot, message, target_id: int, prefix: str, caption_or_
     elif message.audio:
         await bot.send_audio(chat_id=target_id, audio=message.audio.file_id, caption=f"{prefix} {message_content}", parse_mode=parse_mode)
     elif message.voice:
-        # 语音消息
         await bot.send_voice(chat_id=target_id, voice=message.voice.file_id)
-        # 补充发送来源信息（语音不支持 caption）
         await bot.send_message(chat_id=target_id, text=prefix, parse_mode=parse_mode)
     elif message.text:
         await bot.send_message(chat_id=target_id, text=f"{prefix} {message_content}", parse_mode=parse_mode)
     else:
-        return False # 不支持的消息类型
+        return False 
 
-    return True # 转发成功
+    return True
 
 
-# --- 3. 处理器函数 ---
+# --- 4. 封禁管理命令 ---
+
+async def ban_user(update: Update, context):
+    """管理员命令：/ban <user_id>"""
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return # 仅管理员可执行
+
+    if not context.args or SessionLocal is None:
+        await update.message.reply_text("用法: /ban <用户ID> (必须提供ID)")
+        return
+
+    try:
+        user_id_to_ban = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("错误: ID 必须是整数。")
+        return
+
+    session = SessionLocal()
+    try:
+        new_banned_user = BannedUser(user_id=user_id_to_ban)
+        session.add(new_banned_user)
+        session.commit()
+        await update.message.reply_text(f"✅ 用户 ID {user_id_to_ban} 已成功封禁。")
+    except IntegrityError:
+        session.rollback()
+        await update.message.reply_text(f"⚠️ 用户 ID {user_id_to_ban} 已经在封禁列表中。")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 封禁失败：{e}")
+    finally:
+        session.close()
+
+
+async def unban_user(update: Update, context):
+    """管理员命令：/unban <user_id>"""
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return # 仅管理员可执行
+
+    if not context.args or SessionLocal is None:
+        await update.message.reply_text("用法: /unban <用户ID> (必须提供ID)")
+        return
+
+    try:
+        user_id_to_unban = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("错误: ID 必须是整数。")
+        return
+
+    session = SessionLocal()
+    try:
+        # 查找要删除的用户
+        stmt = select(BannedUser).where(BannedUser.user_id == user_id_to_unban)
+        user_to_delete = session.execute(stmt).scalar_one_or_none()
+        
+        if user_to_delete:
+            session.delete(user_to_delete)
+            session.commit()
+            await update.message.reply_text(f"✅ 用户 ID {user_id_to_unban} 已解除封禁。")
+        else:
+            await update.message.reply_text(f"⚠️ 用户 ID {user_id_to_unban} 不在封禁列表中。")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 解除封禁失败：{e}")
+    finally:
+        session.close()
+
+
+# --- 5. 核心消息转发处理器 ---
 
 async def start_command(update: Update, context):
     """处理 /start 命令，并打印用户的 Chat ID"""
+    # (代码与上一版本保持一致，此处省略)
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user.username else "N/A"
     
-    # 打印到控制台/Railway日志，用于捕获 ID
     print(f"--- 捕获 ID ---")
     print(f"User: @{username}")
     print(f"Chat ID: {chat_id}")
@@ -88,15 +202,20 @@ async def relay_message(update: Update, context):
     caption_or_text = message.caption if message.caption else message.text
     
     # ----------------------------------------------------
-    # Logic 1A: ADMIN REPLY TO USER MESSAGE (Feature 4: 回复转发)
+    # Logic 2 Check: 封禁用户检查 (Feature 3)
+    # ----------------------------------------------------
+    if incoming_chat_id != ADMIN_CHAT_ID and is_user_banned(incoming_chat_id):
+        await message.reply_text("❌ 您的消息无法发送，您已被管理员禁止使用本服务。")
+        return
+
+    # ----------------------------------------------------
+    # Logic 1A: ADMIN REPLY TO USER MESSAGE (Feature 4)
     # ----------------------------------------------------
     if incoming_chat_id == ADMIN_CHAT_ID and message.reply_to_message:
         
-        # 提取管理员回复的消息内容
         replied_content = message.reply_to_message.caption if message.reply_to_message.caption else message.reply_to_message.text
         
         if replied_content:
-            # 使用正则表达式匹配原始发送者的 ID
             match = re.search(ID_REGEX, replied_content)
             
             if match:
@@ -104,15 +223,14 @@ async def relay_message(update: Update, context):
                 forward_prefix = "【管理员回复】" 
                 
                 try:
-                    # 精准转发给原始用户
-                    is_forwarded = await attempt_forward(context.bot, message, original_sender_id, forward_prefix, caption_or_text)
+                    is_forwarded = await attempt_forward(context.bot, message, original_sender_id, forward_prefix, caption_or_text, parse_mode=None)
 
                     if is_forwarded:
                         await message.reply_text(f"✅ 回复已成功发送给用户 ID: {original_sender_id}。")
                     else:
                         await message.reply_text("⚠️ 无法识别或转发您的回复消息类型。")
                     
-                    return # 成功处理回复，退出函数
+                    return 
                 
                 except Exception as e:
                     await message.reply_text(f"❌ 转发给用户 ID {original_sender_id} 失败。错误: {e}")
@@ -120,7 +238,7 @@ async def relay_message(update: Update, context):
                     return
 
     # ----------------------------------------------------
-    # Logic 1B: ADMIN BROADCAST (非回复消息，执行广播)
+    # Logic 1B: ADMIN BROADCAST
     # ----------------------------------------------------
     if incoming_chat_id == ADMIN_CHAT_ID:
         
@@ -132,11 +250,9 @@ async def relay_message(update: Update, context):
         failure_count = 0
         forward_prefix = "【管理员广播】" 
         
-        # 循环广播给所有 TARGET_IDS
         for target_id in TARGET_CHAT_IDS:
             try:
-                # 使用辅助函数转发
-                is_forwarded = await attempt_forward(context.bot, message, target_id, forward_prefix, caption_or_text)
+                is_forwarded = await attempt_forward(context.bot, message, target_id, forward_prefix, caption_or_text, parse_mode=None)
                 
                 if is_forwarded:
                     success_count += 1
@@ -151,10 +267,9 @@ async def relay_message(update: Update, context):
         )
 
     # ----------------------------------------------------
-    # Logic 2: USER TO ADMIN (用户消息转发给管理员)
+    # Logic 2: USER TO ADMIN
     # ----------------------------------------------------
     else:
-        # ⚠️ 待办：在这里检查用户是否被封禁 (Feature 3)
         
         if ADMIN_CHAT_ID < 0:
             await message.reply_text("❌ 抱歉，管理员 ID 未设置或设置错误，消息无法转发。")
@@ -162,10 +277,8 @@ async def relay_message(update: Update, context):
 
         # 转发给 ADMIN
         try:
-            # Prefix for admin message (使用 MarkdownV2 格式化 ID)
             forward_text = f"【新用户消息】来自 ID: `{incoming_chat_id}`:\n\n"
             
-            # 使用辅助函数转发给管理员，指定 MarkdownV2 格式
             is_forwarded = await attempt_forward(context.bot, message, ADMIN_CHAT_ID, forward_text, caption_or_text, parse_mode=ParseMode.MARKDOWN_V2)
             
             if is_forwarded:
@@ -178,13 +291,16 @@ async def relay_message(update: Update, context):
             print(f"转发给管理员失败: {e}")
 
 
-# --- 4. 主函数 ---
+# --- 6. 主函数 ---
 
 def main():
     if TOKEN == "YOUR_LOCAL_TEST_TOKEN":
         print("❌ 错误：TOKEN 环境变量未设置。")
         return
-    
+        
+    if DATABASE_URL:
+        init_db(DATABASE_URL) # 初始化数据库
+
     if ADMIN_CHAT_ID < 0:
         print("⚠️ 警告：ADMIN_ID 未在环境变量中正确设置，接收转发功能将受限。")
 
@@ -194,7 +310,10 @@ def main():
         print(f"❌ 错误：创建 Application 失败，Token 可能无效。错误信息: {e}")
         return
 
+    # 消息处理器
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("ban", ban_user)) # 新增封禁命令
+    application.add_handler(CommandHandler("unban", unban_user)) # 新增解禁命令
     application.add_handler(MessageHandler(filters.ALL, relay_message))
 
     print("✅ Bot starting polling...")
