@@ -86,3 +86,16 @@ Value（值）： 粘贴您在步骤 1 中复制的令牌。
 Railway 正在运行最新的转发代码： 您的 Railway 机器人现在正在运行包含多目标转发逻辑的最新版本。
 
 配置 Chat ID： 您的首要任务仍然是配置 ADMIN_ID 和 TARGET_IDS 变量，以使双向转发功能正常工作。
+
+1. 配置 PostgreSQL 数据库
+我们将在 Railway 上添加一个 PostgreSQL 数据库。Railway 会自动将数据库连接信息（DATABASE_URL）注入到您的机器人服务中。
+
+操作步骤：
+
+登录您的 Railway Dashboard。
+
+进入您的项目（Project）。
+
+点击 New（新建）→ Database（数据库）→ PostgreSQL。
+
+等待数据库部署完成。
