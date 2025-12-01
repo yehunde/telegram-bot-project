@@ -5,13 +5,13 @@ from typing import Final, List, Optional
 
 # 导入 Telegram Bot 库
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from telegram import Update, InputFile, ParseMode
+from telegram import Update, ParseMode
 
 # 导入 SQLAlchemy 数据库库
-from sqlalchemy import create_engine, Column, Integer
+from sqlalchemy import create_engine, Column, Integer, select
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, OperationalError
+
 
 # --- 1. 配置常量和数据库初始化 ---
 
@@ -39,7 +39,7 @@ if TARGET_IDS_STR:
 ID_REGEX: Final = r"【新用户消息】来自 ID: `(\d+)`:"
 
 
-# --- 2. 数据库模型 ---
+# --- 2. 数据库模型和工具 ---
 
 class BannedUser(Base):
     """被封禁用户模型"""
@@ -54,13 +54,18 @@ class BannedUser(Base):
 def init_db(db_url: str):
     """初始化数据库引擎和表"""
     global SessionLocal
-    # Railway 使用 postgres:// 协议，但 SQLAlchemy 需要 postgresql:// 
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
-    
-    engine = create_engine(db_url)
-    Base.metadata.create_all(engine)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    print("✅ Database initialized and tables created.")
+    try:
+        # Railway 使用 postgres:// 协议，但 SQLAlchemy 需要 postgresql:// 
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+        
+        engine = create_engine(db_url)
+        Base.metadata.create_all(engine)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        print("✅ Database initialized and tables created.")
+    except Exception as e:
+        # 捕获任何连接或创建错误，并继续运行
+        print(f"❌ 数据库初始化失败，封禁功能将禁用。错误: {e}")
+        SessionLocal = None
 
 
 def is_user_banned(user_id: int) -> bool:
@@ -70,10 +75,13 @@ def is_user_banned(user_id: int) -> bool:
         
     session = SessionLocal()
     try:
-        # 使用 SQLAlchemy 2.0 风格的 select
         stmt = select(BannedUser).where(BannedUser.user_id == user_id)
         result = session.execute(stmt).scalar_one_or_none()
         return result is not None
+    except OperationalError as e:
+        # 如果数据库在运行时断开，捕获此错误
+        print(f"⚠️ 数据库运行时错误，暂时跳过封禁检查: {e}")
+        return False
     finally:
         session.close()
 
@@ -85,10 +93,7 @@ async def attempt_forward(bot, message, target_id: int, prefix: str, caption_or_
     
     message_content = f"{caption_or_text if caption_or_text else ''}"
     
-    # ... (媒体转发逻辑与上一版本保持一致) ...
-    # 为了节省篇幅，这里简化，实际代码中应包含完整的媒体转发逻辑
-    
-    # --- 媒体转发逻辑 ---
+    # --- 媒体转发逻辑 (保持不变) ---
     if message.photo:
         await bot.send_photo(chat_id=target_id, photo=message.photo[-1].file_id, caption=f"{prefix} {message_content}", parse_mode=parse_mode)
     elif message.video:
@@ -113,12 +118,17 @@ async def attempt_forward(bot, message, target_id: int, prefix: str, caption_or_
 async def ban_user(update: Update, context):
     """管理员命令：/ban <user_id>"""
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return # 仅管理员可执行
+        return 
 
-    if not context.args or SessionLocal is None:
-        await update.message.reply_text("用法: /ban <用户ID> (必须提供ID)")
+    if SessionLocal is None:
+        await update.message.reply_text("❌ 封禁功能禁用：数据库未连接或初始化失败。")
         return
 
+    if not context.args:
+        await update.message.reply_text("用法: /ban <用户ID>")
+        return
+
+    # ... (封禁逻辑保持不变) ...
     try:
         user_id_to_ban = int(context.args[0])
     except ValueError:
@@ -143,12 +153,17 @@ async def ban_user(update: Update, context):
 async def unban_user(update: Update, context):
     """管理员命令：/unban <user_id>"""
     if update.effective_chat.id != ADMIN_CHAT_ID:
-        return # 仅管理员可执行
-
-    if not context.args or SessionLocal is None:
-        await update.message.reply_text("用法: /unban <用户ID> (必须提供ID)")
+        return 
+        
+    if SessionLocal is None:
+        await update.message.reply_text("❌ 解封功能禁用：数据库未连接或初始化失败。")
         return
 
+    if not context.args:
+        await update.message.reply_text("用法: /unban <用户ID>")
+        return
+
+    # ... (解禁逻辑保持不变) ...
     try:
         user_id_to_unban = int(context.args[0])
     except ValueError:
@@ -157,7 +172,6 @@ async def unban_user(update: Update, context):
 
     session = SessionLocal()
     try:
-        # 查找要删除的用户
         stmt = select(BannedUser).where(BannedUser.user_id == user_id_to_unban)
         user_to_delete = session.execute(stmt).scalar_one_or_none()
         
@@ -177,7 +191,6 @@ async def unban_user(update: Update, context):
 
 async def start_command(update: Update, context):
     """处理 /start 命令，并打印用户的 Chat ID"""
-    # (代码与上一版本保持一致，此处省略)
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user.username else "N/A"
     
@@ -204,10 +217,13 @@ async def relay_message(update: Update, context):
     # ----------------------------------------------------
     # Logic 2 Check: 封禁用户检查 (Feature 3)
     # ----------------------------------------------------
-    if incoming_chat_id != ADMIN_CHAT_ID and is_user_banned(incoming_chat_id):
+    # 仅当数据库Session Local存在时才执行检查
+    if SessionLocal is not None and incoming_chat_id != ADMIN_CHAT_ID and is_user_banned(incoming_chat_id):
         await message.reply_text("❌ 您的消息无法发送，您已被管理员禁止使用本服务。")
         return
 
+    # ... (下方逻辑保持不变) ...
+    
     # ----------------------------------------------------
     # Logic 1A: ADMIN REPLY TO USER MESSAGE (Feature 4)
     # ----------------------------------------------------
@@ -300,6 +316,8 @@ def main():
         
     if DATABASE_URL:
         init_db(DATABASE_URL) # 初始化数据库
+    else:
+        print("⚠️ 警告：DATABASE_URL 环境变量缺失，封禁功能将禁用。")
 
     if ADMIN_CHAT_ID < 0:
         print("⚠️ 警告：ADMIN_ID 未在环境变量中正确设置，接收转发功能将受限。")
@@ -312,8 +330,8 @@ def main():
 
     # 消息处理器
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("ban", ban_user)) # 新增封禁命令
-    application.add_handler(CommandHandler("unban", unban_user)) # 新增解禁命令
+    application.add_handler(CommandHandler("ban", ban_user))
+    application.add_handler(CommandHandler("unban", unban_user))
     application.add_handler(MessageHandler(filters.ALL, relay_message))
 
     print("✅ Bot starting polling...")
