@@ -90,7 +90,103 @@ async def start_command(update: Update, context):
         await update.message.reply_text(f"机器人已启动，你的 Chat ID 是: {chat_id}")
 
 
+# ... (其他函数和常量保持不变，包括 attempt_forward 保持不变) ...
+
 async def relay_message(update: Update, context):
+    """
+    核心消息转发处理器。
+    增强用户到管理员的媒体转发，直接使用 forward_message。
+    """
+    
+    message = update.message
+    incoming_chat_id = message.chat_id
+    caption_or_text = message.caption if message.caption else message.text
+    
+    # ----------------------------------------------------
+    # Logic 1A: ADMIN REPLY TO USER MESSAGE (Feature 4: 回复转发)
+    # ----------------------------------------------------
+    if incoming_chat_id == ADMIN_CHAT_ID and message.reply_to_message:
+        
+        replied_content = message.reply_to_message.caption if message.reply_to_message.caption else message.reply_to_message.text
+        
+        if replied_content:
+            match = re.search(ID_REGEX, replied_content)
+            
+            if match:
+                original_sender_id = int(match.group(1))
+                forward_prefix = "【管理员回复】" 
+                
+                # 管理员回复用户：继续使用 attempt_forward (因为它包含前缀)
+                is_forwarded, error_msg = await attempt_forward(context.bot, message, original_sender_id, forward_prefix, caption_or_text)
+
+                if is_forwarded:
+                    await message.reply_text(f"✅ 回复已成功发送给用户 ID: {original_sender_id}。")
+                else:
+                    await message.reply_text(f"❌ 回复转发失败。原因: {error_msg if error_msg else '不支持的消息类型'}")
+                
+                return
+
+    # ----------------------------------------------------
+    # Logic 1B: ADMIN BROADCAST (媒体转发)
+    # ----------------------------------------------------
+    if incoming_chat_id == ADMIN_CHAT_ID:
+        
+        if not TARGET_CHAT_IDS:
+            await message.reply_text("❌ 转发失败：TARGET_IDS 变量未设置或为空。")
+            return
+            
+        success_count = 0
+        failure_count = 0
+        forward_prefix = "【管理员广播】" 
+        
+        for target_id in TARGET_CHAT_IDS:
+            try:
+                # 管理员广播：继续使用 attempt_forward
+                is_forwarded, _ = await attempt_forward(context.bot, message, target_id, forward_prefix, caption_or_text)
+                
+                if is_forwarded:
+                    success_count += 1
+                await asyncio.sleep(0.1) 
+
+            except Exception as e:
+                failure_count += 1
+                print(f"❌ 广播到 ID {target_id} 失败。错误: {e}")
+
+        await message.reply_text(
+            f"✅ 消息已转发完成：成功 {success_count} 个目标，失败 {failure_count} 个目标。"
+        )
+
+    # ----------------------------------------------------
+    # Logic 2: USER TO ADMIN (使用 forward_message 转发媒体)
+    # ----------------------------------------------------
+    else:
+        
+        if ADMIN_CHAT_ID < 0:
+            await message.reply_text("❌ 抱歉，管理员 ID 未设置，消息无法转发。")
+            return
+
+        try:
+            # 1. 发送包含用户 ID 的元数据文本
+            forward_text = f"【新用户消息】来自 ID: `{incoming_chat_id}`:\n\n"
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID, 
+                text=forward_text, 
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            
+            # 2. 直接转发原始消息（媒体、文本、任何类型）
+            # 这不需要处理 file_id，是转发媒体最可靠的方式
+            await message.forward(chat_id=ADMIN_CHAT_ID)
+            
+            # 3. 给予用户确认
+            await message.reply_text("您的消息已转发给管理员，请耐心等待回复。")
+                
+        except Exception as e:
+            # 如果转发失败（例如，管理员 ID 无效，或 Telegram API 临时故障）
+            await message.reply_text("❌ 转发给管理员失败。")
+            print(f"转发给管理员失败: {e}")
+
+async def relay_message_1(update: Update, context):
     """恢复媒体转发和回复转发逻辑"""
     
     message = update.message
